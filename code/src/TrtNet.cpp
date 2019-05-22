@@ -10,19 +10,13 @@
 #include <time.h>
 #include <unordered_map>
 
+using namespace std;
 using namespace nvinfer1;
-using namespace nvcaffeparser1;
-using namespace plugin;
+//using namespace nvcaffeparser1;
+using namespace nvonnxparser;
+//using namespace plugin;
 
 static Tn::Logger gLogger;
-
-#define RETURN_AND_LOG(ret, severity, message)                                 \
-    do                                                                         \
-    {                                                                          \
-        std::string error_message = "ssd_error_log: " + std::string(message); \
-        gLogger.log(ILogger::Severity::k##severity, error_message.c_str());    \
-        return (ret);                                                          \
-    } while (0)
 
 inline void* safeCudaMalloc(size_t memSize)
 {
@@ -56,38 +50,22 @@ inline unsigned int getElementSize(nvinfer1::DataType t)
 
 namespace Tn
 {
-    trtNet::trtNet(const std::string& prototxt,const std::string& caffemodel,const std::vector<std::string>& outputNodesName,
-                    const std::vector<std::vector<float>>& calibratorData,RUN_MODE mode /*= RUN_MODE::FLOAT32*/,int maxBatchSize /*= 1*/)
+    trtNet::trtNet(const std::string& onnxmodel, int maxBatchSize)
     :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtRunMode(mode),mTrtInputCount(0),mTrtIterationTime(0),mTrtBatchSize(maxBatchSize)
     {
-        std::cout << "init plugin proto: " << prototxt << " caffemodel: " << caffemodel << std::endl;
-        auto parser = createCaffeParser();
-
         IHostMemory* trtModelStream{nullptr};
 
-        Int8EntropyCalibrator * calibrator = nullptr;
-        if (calibratorData.size() > 0 ){
-            auto endPos= prototxt.find_last_of(".");
-	        auto beginPos= prototxt.find_last_of('/') + 1;
-            std::string calibratorName = prototxt.substr(beginPos,endPos - beginPos);
-            std::cout << "create calibrator,Named:" << calibratorName << std::endl;
-            calibrator = new Int8EntropyCalibrator(maxBatchSize,calibratorData,calibratorName);
-        }
+        nvonnxparser::IPluginFactory* onnxPlugin = createPluginFactory(gLogger);
 
-        PluginFactory pluginFactorySerialize;
-        ICudaEngine* tmpEngine = loadModelAndCreateEngine(prototxt.c_str(),caffemodel.c_str(), maxBatchSize, parser, &pluginFactorySerialize, calibrator, trtModelStream,outputNodesName);
+        ICudaEngine* tmpEngine = loadModelAndCreateEngine(caffemodel.c_str(), maxBatchSize, parser, trtModelStream);
         assert(tmpEngine != nullptr);
         assert(trtModelStream != nullptr);
-        if(calibrator){
-            delete calibrator;
-            calibrator = nullptr;
-        }
+
         tmpEngine->destroy();
-        pluginFactorySerialize.destroyPlugin();
 
         mTrtRunTime = createInferRuntime(gLogger);     
         assert(mTrtRunTime != nullptr);
-        mTrtEngine= mTrtRunTime->deserializeCudaEngine(trtModelStream->data(), trtModelStream->size(), &mTrtPluginFactory);
+        mTrtEngine= mTrtRunTime->deserializeCudaEngine(trtModelStream->data(), trtModelStream->size(), onnxPlugin);
         assert(mTrtEngine != nullptr);
         // Deserialize the engine.
         trtModelStream->destroy();
@@ -98,27 +76,24 @@ namespace Tn
     trtNet::trtNet(const std::string& engineFile)
     :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtRunMode(RUN_MODE::FLOAT32),mTrtInputCount(0),mTrtIterationTime(0)
     {
-        using namespace std;
-        fstream file;
-        
-        file.open(engineFile,ios::binary | ios::in);
-        if(!file.is_open())
-        {
-            cout << "read engine file" << engineFile <<" failed" << endl;
-            return;
-        }
-        file.seekg(0, ios::end); 
-        int length = file.tellg();         
-        file.seekg(0, ios::beg); 
-        std::unique_ptr<char[]> data(new char[length]);
-        file.read(data.get(), length);
-
-        file.close();
+	using namespace std;
+	fstream file;
+	cout << "loading filename from:" << engineFile << endl;
+	nvonnxparser::IPluginFactory* onnxPlugin = createPluginFactory(gLogger);
+	file.open(engineFile, ios::binary | ios::in);
+	file.seekg(0, ios::end);
+	int length = file.tellg();
+	//cout << "length:" << length << endl;
+	file.seekg(0, ios::beg);
+	std::unique_ptr<char[]> data(new char[length]);
+	file.read(data.get(), length);
+	file.close();
+	cout << "load engine done" << endl;
 
         std::cout << "deserializing" << std::endl;
         mTrtRunTime = createInferRuntime(gLogger);
         assert(mTrtRunTime != nullptr);
-        mTrtEngine= mTrtRunTime->deserializeCudaEngine(data.get(), length, &mTrtPluginFactory);
+        mTrtEngine= mTrtRunTime->deserializeCudaEngine(data.get(), length, onnxPlugin);
         assert(mTrtEngine != nullptr);
 
         InitEngine();
@@ -129,7 +104,6 @@ namespace Tn
         mTrtBatchSize = mTrtEngine->getMaxBatchSize();
         mTrtContext = mTrtEngine->createExecutionContext();
         assert(mTrtContext != nullptr);
-        mTrtContext->setProfiler(&mTrtProfiler);
 
         // Input and output buffer pointers that we pass to the engine - the engine requires exactly IEngine::getNbBindings()
         int nbBindings = mTrtEngine->getNbBindings();
@@ -151,58 +125,27 @@ namespace Tn
     }
 
 
-    nvinfer1::ICudaEngine* trtNet::loadModelAndCreateEngine(const char* deployFile, const char* modelFile,int maxBatchSize,
-                                        ICaffeParser* parser, nvcaffeparser1::IPluginFactory* pluginFactory,
-                                        IInt8Calibrator* calibrator, IHostMemory*& trtModelStream,const std::vector<std::string>& outputNodesName)
+    nvinfer1::ICudaEngine* trtNet::loadModelAndCreateEngine(const char* modelFile,int maxBatchSize, IHostMemory*& trtModelStream)
     {
         // Create the builder
         IBuilder* builder = createInferBuilder(gLogger);
+        assert(builder != nullptr);
 
-        // Parse the model to populate the network, then set the outputs.
-        INetworkDefinition* network = builder->createNetwork();
-        parser->setPluginFactory(pluginFactory);
+        // Parse the model to populate the network
+        nvinfer1::INetworkDefinition* network = builder->createNetwork();
+        auto parser = nvonnxparser::createParser(*network, gLogger);
 
-        std::cout << "Begin parsing model..." << std::endl;
-        const IBlobNameToTensor* blobNameToTensor = parser->parse(deployFile,modelFile, *network, nvinfer1::DataType::kFLOAT);
-        if (!blobNameToTensor)
-            RETURN_AND_LOG(nullptr, ERROR, "Fail to parse");
-        std::cout << "End parsing model..." << std::endl;
+	// Build the engine
+	builder->setMaxBatchSize(maxBatchSize);
+	builder->setMaxWorkspaceSize(1 << 30);
+	builder->setFp16Mode(true);
+	builder->setInt8Mode(false);
 
-        // specify which tensors are outputs
-        for (auto& name : outputNodesName)
-        {
-            auto output = blobNameToTensor->find(name.c_str());
-            assert(output!=nullptr);
-            if (output == nullptr)
-                std::cout << "can not find output named " << name << std::endl;
-
-            network->markOutput(*output);
-        }
-
-        // Build the engine.
-        builder->setMaxBatchSize(maxBatchSize);
-        builder->setMaxWorkspaceSize(1 << 30);// 1G
-        if (mTrtRunMode == RUN_MODE::INT8)
-        {
-             std::cout <<"setInt8Mode"<<std::endl;
-            if (!builder->platformHasFastInt8())
-                std::cout << "Notice: the platform do not has fast for int8" << std::endl;
-            builder->setInt8Mode(true);
-            builder->setInt8Calibrator(calibrator);
-        }
-        else if (mTrtRunMode == RUN_MODE::FLOAT16)
-        {
-            std::cout <<"setFp16Mode"<<std::endl;
-            if (!builder->platformHasFastFp16())
-                std::cout << "Notice: the platform do not has fast for fp16" << std::endl;
-            builder->setFp16Mode(true);
-        }
-
-        std::cout << "Begin building engine..." << std::endl;
-        ICudaEngine* engine = builder->buildCudaEngine(*network);
-        if (!engine)
-            RETURN_AND_LOG(nullptr, ERROR, "Unable to create engine");
-        std::cout << "End building engine..." << std::endl;
+	samplesCommon::enableDLA(builder, gArgs.useDLACore);
+	cout << "start building engine" << endl;
+	ICudaEngine* engine = builder->buildCudaEngine(*network);
+	cout << "build engine done" << endl;
+	assert(engine);
 
         // We don't need the network any more, and we can destroy the parser.
         network->destroy();
@@ -212,11 +155,10 @@ namespace Tn
         trtModelStream = engine->serialize();
 
         builder->destroy();
-        shutdownProtobufLibrary();
         return engine;
     }
 
-    void trtNet::doInference(const void* inputData, void* outputData ,int batchSize /*= 1*/)
+    void trtNet::doInference(const void* inputData, void* outputData ,int batchSize)
     {
         //static const int batchSize = 1;
         assert(mTrtInputCount == 1);
