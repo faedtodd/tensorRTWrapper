@@ -1,5 +1,7 @@
 #include "TrtNet.h"
 #include "EntroyCalibrator.h"
+#include "NvOnnxParser.h"
+#include "NvOnnxParserRuntime.h"
 #include <cassert>
 #include <chrono>
 #include <cublas_v2.h>
@@ -51,13 +53,13 @@ inline unsigned int getElementSize(nvinfer1::DataType t)
 namespace Tn
 {
     trtNet::trtNet(const std::string& onnxmodel, int maxBatchSize)
-    :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtRunMode(mode),mTrtInputCount(0),mTrtIterationTime(0),mTrtBatchSize(maxBatchSize)
+    :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtInputCount(0),mTrtIterationTime(0),mTrtBatchSize(maxBatchSize)
     {
         IHostMemory* trtModelStream{nullptr};
 
         nvonnxparser::IPluginFactory* onnxPlugin = createPluginFactory(gLogger);
 
-        ICudaEngine* tmpEngine = loadModelAndCreateEngine(caffemodel.c_str(), maxBatchSize, parser, trtModelStream);
+        ICudaEngine* tmpEngine = loadModelAndCreateEngine(onnxmodel, maxBatchSize, trtModelStream);
         assert(tmpEngine != nullptr);
         assert(trtModelStream != nullptr);
 
@@ -74,7 +76,7 @@ namespace Tn
     }
 
     trtNet::trtNet(const std::string& engineFile)
-    :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtRunMode(RUN_MODE::FLOAT32),mTrtInputCount(0),mTrtIterationTime(0)
+    :mTrtContext(nullptr),mTrtEngine(nullptr),mTrtRunTime(nullptr),mTrtInputCount(1),mTrtIterationTime(0)
     {
 	using namespace std;
 	fstream file;
@@ -117,15 +119,15 @@ namespace Tn
             int64_t totalSize = volume(dims) * mTrtBatchSize * getElementSize(dtype);
             mTrtBindBufferSize[i] = totalSize;
             mTrtCudaBuffer[i] = safeCudaMalloc(totalSize);
-            if(mTrtEngine->bindingIsInput(i))
-                mTrtInputCount++;
+            //if(mTrtEngine->bindingIsInput(i))
+            //    mTrtInputCount++;
         }
 
         CUDA_CHECK(cudaStreamCreate(&mTrtCudaStream));
     }
 
 
-    nvinfer1::ICudaEngine* trtNet::loadModelAndCreateEngine(const char* modelFile,int maxBatchSize, IHostMemory*& trtModelStream)
+    nvinfer1::ICudaEngine* trtNet::loadModelAndCreateEngine(const std::string& modelFile,int maxBatchSize, IHostMemory*& trtModelStream)
     {
         // Create the builder
         IBuilder* builder = createInferBuilder(gLogger);
@@ -134,6 +136,8 @@ namespace Tn
         // Parse the model to populate the network
         nvinfer1::INetworkDefinition* network = builder->createNetwork();
         auto parser = nvonnxparser::createParser(*network, gLogger);
+        parser->parseFromFile(modelFile.c_str(), 1);
+        
 
 	// Build the engine
 	builder->setMaxBatchSize(maxBatchSize);
@@ -141,7 +145,6 @@ namespace Tn
 	builder->setFp16Mode(true);
 	builder->setInt8Mode(false);
 
-	samplesCommon::enableDLA(builder, gArgs.useDLACore);
 	cout << "start building engine" << endl;
 	ICudaEngine* engine = builder->buildCudaEngine(*network);
 	cout << "build engine done" << endl;

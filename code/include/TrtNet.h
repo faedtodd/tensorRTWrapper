@@ -7,7 +7,8 @@
 #include <fstream>
 #include <numeric>
 #include "NvInferPlugin.h"
-#include "NvCaffeParser.h"
+#include "NvOnnxParser.h"
+#include "NvOnnxParserRuntime.h"
 #include "PluginFactory.h"
 #include "Utils.h"
 
@@ -24,8 +25,7 @@ namespace Tn
     {
         public:
             //Load from caffe model
-            trtNet(const std::string& prototxt,const std::string& caffeModel,const std::vector<std::string>& outputNodesName,
-                    const std::vector<std::vector<float>>& calibratorData, RUN_MODE mode = RUN_MODE::FLOAT32 , int maxBatchSize = 1);
+            trtNet(const std::string& onnxModel, int maxBatchSize);
         
             //Load from engine file
             explicit trtNet(const std::string& engineFile);
@@ -38,7 +38,6 @@ namespace Tn
                 for(auto& item : mTrtCudaBuffer)
                     cudaFree(item);
 
-                mTrtPluginFactory.destroyPlugin();
 
                 if(!mTrtRunTime)
                     mTrtRunTime->destroy();
@@ -84,19 +83,15 @@ namespace Tn
             inline int getBatchSize() {return mTrtBatchSize;};
 
         private:
-                nvinfer1::ICudaEngine* loadModelAndCreateEngine(const char* deployFile, const char* modelFile,int maxBatchSize,
-                                        nvcaffeparser1::ICaffeParser* parser, nvcaffeparser1::IPluginFactory* pluginFactory,
-                                        nvinfer1::IInt8Calibrator* calibrator, nvinfer1::IHostMemory*& trtModelStream,const std::vector<std::string>& outputNodesName);
+                nvinfer1::ICudaEngine* loadModelAndCreateEngine(const std::string& modelFile,int maxBatchSize, nvinfer1::IHostMemory*& trtModelStream);
 
                 void InitEngine();
 
                 nvinfer1::IExecutionContext* mTrtContext;
                 nvinfer1::ICudaEngine* mTrtEngine;
-                nvinfer1::IRuntime* mTrtRunTime;
-                PluginFactory mTrtPluginFactory;    
+                nvinfer1::IRuntime* mTrtRunTime;   
                 cudaStream_t mTrtCudaStream;
                 Profiler mTrtProfiler;
-                RUN_MODE mTrtRunMode;
 
                 std::vector<void*> mTrtCudaBuffer;
                 std::vector<int64_t> mTrtBindBufferSize;
